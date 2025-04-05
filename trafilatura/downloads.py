@@ -201,14 +201,46 @@ def _initiate_pool(
     return pool
 
 
-def _send_urllib_request(
-    url: str, no_ssl: bool, with_headers: bool, config: ConfigParser
-) -> Optional[Response]:
-    "Internal function to robustly send a request (SSL or not) and return its result."
+# def _send_urllib_request(
+#     url: str, no_ssl: bool, with_headers: bool, config: ConfigParser
+# ) -> Optional[Response]:
+#     "Internal function to robustly send a request (SSL or not) and return its result."
+#     try:
+#         pool_manager = _initiate_pool(config, no_ssl=no_ssl)
+
+#         # execute request, stop downloading as soon as MAX_FILE_SIZE is reached
+#         response = pool_manager.request(
+#             "GET",
+#             url,
+#             headers=_determine_headers(config),
+#             retries=_get_retry_strategy(config),
+#             preload_content=False,
+#         )
+#         data = bytearray()
+#         for chunk in response.stream(2**17):
+#             data.extend(chunk)
+#             if len(data) > config.getint("DEFAULT", "MAX_FILE_SIZE"):
+#                 raise ValueError("MAX_FILE_SIZE exceeded")
+#         response.release_conn()
+
+#         # necessary for standardization
+#         resp = Response(bytes(data), response.status, response.geturl())
+#         if with_headers:
+#             resp.store_headers(response.headers)
+#         return resp
+
+#     except urllib3.exceptions.SSLError:
+#         LOGGER.warning("retrying after SSLError: %s", url)
+#         return _send_urllib_request(url, True, with_headers, config)
+#     except Exception as err:
+#         LOGGER.error("download error: %s %s", url, err)  # sys.exc_info()[0]
+
+#     return None
+
+def _send_urllib_request(url: str, no_ssl: bool, with_headers: bool, config: ConfigParser) -> Optional[Response]:
+    response = None
     try:
         pool_manager = _initiate_pool(config, no_ssl=no_ssl)
-
-        # execute request, stop downloading as soon as MAX_FILE_SIZE is reached
         response = pool_manager.request(
             "GET",
             url,
@@ -221,9 +253,6 @@ def _send_urllib_request(
             data.extend(chunk)
             if len(data) > config.getint("DEFAULT", "MAX_FILE_SIZE"):
                 raise ValueError("MAX_FILE_SIZE exceeded")
-        response.release_conn()
-
-        # necessary for standardization
         resp = Response(bytes(data), response.status, response.geturl())
         if with_headers:
             resp.store_headers(response.headers)
@@ -233,9 +262,11 @@ def _send_urllib_request(
         LOGGER.warning("retrying after SSLError: %s", url)
         return _send_urllib_request(url, True, with_headers, config)
     except Exception as err:
-        LOGGER.error("download error: %s %s", url, err)  # sys.exc_info()[0]
-
-    return None
+        LOGGER.error("download error: %s %s", url, err)
+        return None
+    finally:
+        if response is not None:
+            response.release_conn()
 
 
 def _is_suitable_response(url: str, response: Response, options: Extractor) -> bool:
@@ -439,87 +470,63 @@ def buffered_response_downloads(
     return _buffered_downloads(bufferlist, download_threads, worker)
 
 
-def _send_pycurl_request(
-    url: str, no_ssl: bool, with_headers: bool, config: ConfigParser
-) -> Optional[Response]:
-    """Experimental function using libcurl and pycurl to speed up downloads"""
-    # https://github.com/pycurl/pycurl/blob/master/examples/retriever-multi.py
-
-    # init
-    headerlist = [
-        f"{header}: {content}" for header, content in _determine_headers(config).items()
-    ]
-
-    # prepare curl request
-    # https://curl.haxx.se/libcurl/c/curl_easy_setopt.html
+def _send_pycurl_request(url: str, no_ssl: bool, with_headers: bool, config: ConfigParser) -> Optional[Response]:
+    """Experimental function using libcurl and pycurl to speed up downloads with proper cleanup."""
     curl = pycurl.Curl()
-    curl.setopt(pycurl.URL, url.encode("utf-8"))
-    # share data
-    curl.setopt(pycurl.SHARE, CURL_SHARE)
-    curl.setopt(pycurl.HTTPHEADER, headerlist)
-    # curl.setopt(pycurl.USERAGENT, '')
-    curl.setopt(pycurl.FOLLOWLOCATION, 1)
-    curl.setopt(pycurl.MAXREDIRS, config.getint("DEFAULT", "MAX_REDIRECTS"))
-    curl.setopt(pycurl.CONNECTTIMEOUT, config.getint("DEFAULT", "DOWNLOAD_TIMEOUT"))
-    curl.setopt(pycurl.TIMEOUT, config.getint("DEFAULT", "DOWNLOAD_TIMEOUT"))
-    curl.setopt(pycurl.MAXFILESIZE, config.getint("DEFAULT", "MAX_FILE_SIZE"))
-    curl.setopt(pycurl.NOSIGNAL, 1)
-
-    if no_ssl is True:
-        curl.setopt(pycurl.SSL_VERIFYPEER, 0)
-        curl.setopt(pycurl.SSL_VERIFYHOST, 0)
-    else:
-        curl.setopt(pycurl.CAINFO, certifi.where())
-
-    if with_headers:
-        headerbytes = BytesIO()
-        curl.setopt(pycurl.HEADERFUNCTION, headerbytes.write)
-
-    if PROXY_URL:
-        curl.setopt(pycurl.PRE_PROXY, PROXY_URL)
-
-    # TCP_FASTOPEN
-    # curl.setopt(pycurl.FAILONERROR, 1)
-    # curl.setopt(pycurl.ACCEPT_ENCODING, '')
-
-    # send request
     try:
-        bufferbytes = curl.perform_rb()
-    except pycurl.error as err:
-        LOGGER.error("pycurl error: %s %s", url, err)
-        # retry in case of SSL-related error
-        # see https://curl.se/libcurl/c/libcurl-errors.html
-        # errmsg = curl.errstr_raw()
-        # additional error codes: 80, 90, 96, 98
-        if no_ssl is False and err.args[0] in CURL_SSL_ERRORS:
-            LOGGER.debug("retrying after SSL error: %s %s", url, err)
-            return _send_pycurl_request(url, True, with_headers, config)
-        # traceback.print_exc(file=sys.stderr)
-        # sys.stderr.flush()
-        return None
+        headerlist = [
+            f"{header}: {content}" for header, content in _determine_headers(config).items()
+        ]
 
-    # additional info
-    # ip_info = curl.getinfo(curl.PRIMARY_IP)
+        # Prepare curl request
+        curl.setopt(pycurl.URL, url.encode("utf-8"))
+        curl.setopt(pycurl.SHARE, CURL_SHARE)
+        curl.setopt(pycurl.HTTPHEADER, headerlist)
+        curl.setopt(pycurl.FOLLOWLOCATION, 1)
+        curl.setopt(pycurl.MAXREDIRS, config.getint("DEFAULT", "MAX_REDIRECTS"))
+        curl.setopt(pycurl.CONNECTTIMEOUT, config.getint("DEFAULT", "DOWNLOAD_TIMEOUT"))
+        curl.setopt(pycurl.TIMEOUT, config.getint("DEFAULT", "DOWNLOAD_TIMEOUT"))
+        curl.setopt(pycurl.MAXFILESIZE, config.getint("DEFAULT", "MAX_FILE_SIZE"))
+        curl.setopt(pycurl.NOSIGNAL, 1)
 
-    resp = Response(
-        bufferbytes, curl.getinfo(curl.RESPONSE_CODE), curl.getinfo(curl.EFFECTIVE_URL)
-    )
-    curl.close()
+        if no_ssl:
+            curl.setopt(pycurl.SSL_VERIFYPEER, 0)
+            curl.setopt(pycurl.SSL_VERIFYHOST, 0)
+        else:
+            curl.setopt(pycurl.CAINFO, certifi.where())
 
-    if with_headers:
-        respheaders = {}
-        # https://github.com/pycurl/pycurl/blob/master/examples/quickstart/response_headers.py
-        for line in (
-            headerbytes.getvalue().decode("iso-8859-1", errors="replace").splitlines()
-        ):
-            # re.split(r'\r?\n') ?
-            # This will botch headers that are split on multiple lines...
-            if ":" not in line:
-                continue
-            # Break the header line into header name and value.
-            name, value = line.split(":", 1)
-            # Now we can actually record the header name and value.
-            respheaders[name.strip()] = value.strip()  # name.strip().lower() ?
-        resp.store_headers(respheaders)
+        if with_headers:
+            headerbytes = BytesIO()
+            curl.setopt(pycurl.HEADERFUNCTION, headerbytes.write)
 
-    return resp
+        if PROXY_URL:
+            curl.setopt(pycurl.PRE_PROXY, PROXY_URL)
+
+        # Send request
+        try:
+            bufferbytes = curl.perform_rb()
+        except pycurl.error as err:
+            LOGGER.error("pycurl error: %s %s", url, err)
+            if not no_ssl and err.args[0] in CURL_SSL_ERRORS:
+                LOGGER.debug("retrying after SSL error: %s %s", url, err)
+                return _send_pycurl_request(url, True, with_headers, config)
+            return None
+
+        resp = Response(
+            bufferbytes, curl.getinfo(curl.RESPONSE_CODE), curl.getinfo(curl.EFFECTIVE_URL)
+        )
+
+        if with_headers:
+            respheaders = {}
+            for line in headerbytes.getvalue().decode("iso-8859-1", errors="replace").splitlines():
+                if ":" not in line:
+                    continue
+                name, value = line.split(":", 1)
+                respheaders[name.strip()] = value.strip()
+            resp.store_headers(respheaders)
+
+        return resp
+
+    finally:
+        # Ensure the curl handle is always closed to prevent lingering connections.
+        curl.close()
